@@ -12,18 +12,18 @@
     ansible.builtin.apt:
       upgrade: full
 
-  - name: remove old container runtimes
-    ansible.builtin.apt:
-      name: 
-        - docker.io 
-        - docker-doc 
-        - docker-compose 
-        - docker-compose-v2 
-        - podman-docker 
-        - containerd 
-        - runc
-      state: absent
-      purge: yes
+  # - name: remove old container runtimes
+  #   ansible.builtin.apt:
+  #     name: 
+  #       - docker.io 
+  #       - docker-doc 
+  #       - docker-compose 
+  #       - docker-compose-v2 
+  #       - podman-docker 
+  #       - containerd 
+  #       - runc
+  #     state: absent
+  #     purge: yes
 
   - name: turn off swap 1/2
     command: swapoff -a
@@ -50,61 +50,78 @@
         rule: allow
         src: 192.168.178.0/24
         port: '2379:2380'
+        proto: tcp
 
     - name: kubelet api
       community.general.ufw:
         rule: allow
         src: 192.168.178.0/24
         port: '10250'
+        proto: tcp
 
     - name: nodeport services
       community.general.ufw:
         rule: allow
         port: '30000:32767'
+        proto: tcp
 
     - name: kube-scheduler
       community.general.ufw:
         rule: allow
         src: 192.168.178.0/24
         port: '10259'
+        proto: tcp
 
     - name: kube-controller-manager
       community.general.ufw:
         rule: allow
         src: 192.168.178.0/24
         port: '10257'
+        proto: tcp
 
     - name: VXLAN Overlay
       community.general.ufw:
         rule: allow
         src: 192.168.178.0/24
-        port: '8472/udp'
+        port: '8472'
+        proto: udp
 
     - name: healthchecks
       community.general.ufw:
         rule: allow
         src: 192.168.178.0/24
-        port: '4240tcp'
+        port: '4240'
+        proto: udp
 
-    - name: allow icmp echo-request from cluster subnet
-      community.general.ufw:
-        rule: allow
-        proto: icmp
-        icmp_type: 8
-        src: 192.168.178.0/24
+    # - name: allow icmp echo-request from cluster subnet
+    #   community.general.ufw:
+    #     rule: allow
+    #     proto: icmp
+    #     icmp_type: 8
+    #     src: 192.168.178.0/24
 
-    - name: allow icmp echo-reply (type 0)
-      community.general.ufw:
-        rule: allow
-        proto: icmp
-        icmp_type: 0
-        src: 192.168.178.0/24
+    # - name: allow icmp echo-reply (type 0)
+    #   community.general.ufw:
+    #     rule: allow
+    #     proto: icmp
+    #     icmp_type: 0
+    #     src: 192.168.178.0/24
 
 - name: enable ipv4 packet forwarding
   hosts: all
   become: true
 
   tasks:
+    - name: enable kernel modules
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: load br_netfilter
+      command: modprobe br_netfilter
+
     - name: enable IPv4 forwarding
       ansible.builtin.sysctl:
         name: net.ipv4.ip_forward
@@ -141,7 +158,7 @@
         modprobe overlay
         modprobe br_netfilter
 
-- name: prepare and install container runtime
+- name: install and configure containerd correctly
   hosts: all
   become: true
 
@@ -150,30 +167,48 @@
       ansible.builtin.apt:
         name: containerd
         state: present
+        update_cache: yes
 
-    - name: create containerd directory
+    - name: stop containerd service before modifying config
+      ansible.builtin.service:
+        name: containerd
+        state: stopped
+
+    - name: ensure containerd config directory exists
       ansible.builtin.file:
         path: /etc/containerd
         state: directory
         mode: '0755'
-        owner: root
-        group: root
 
-    - name: Create containerd config.toml
-      ansible.builtin.shell: containerd config default > /etc/containerd/config.toml
+    - name: backup old containerd config if present
+      ansible.builtin.command: mv /etc/containerd/config.toml /etc/containerd/config.toml.bak
+      args:
+        removes: /etc/containerd/config.toml
+      ignore_errors: true
+
+    - name: generate fresh default config.toml for containerd
+      ansible.builtin.shell: |
+        containerd config default > /etc/containerd/config.toml
       args:
         creates: /etc/containerd/config.toml
-    
-    - name: configure systemd cgroup driver
-      ansible.builtin.lineinfile:
-        path: /etc/containerd/config.toml
-        regexp: '^(\s*)SystemdCgroup\s*=\s*false'
-        line: 'SystemdCgroup = true'
 
-    - name: restart containerd
+    - name: enable SystemdCgroup in containerd
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup *= *false'
+        replace: 'SystemdCgroup = true'
+
+    - name: start and enable containerd service
       ansible.builtin.service:
         name: containerd
-        state: restarted
+        state: started
+        enabled: true
+
+    - name: verify CRI works (crictl info)
+      ansible.builtin.command: crictl info
+      register: cri_info
+      changed_when: false
+      failed_when: cri_info.rc != 0
 
 - name: install kubelet, kubeadm, kubectl
   hosts: all
@@ -222,11 +257,12 @@
 
     - name: pin kube-tools version
       ansible.builtin.dpkg_selections:
-        name:
-          - kubelet
-          - kubeadm
-          - kubectl
+        name: "{{ item }}"
         selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
     
     - name: enable kubelet service
       ansible.builtin.service:
@@ -239,65 +275,114 @@
   become: true
 
   tasks:
+
+    # - name: remove wrong kubeconfig directory if it exists
+    #   ansible.builtin.file:
+    #     path: /root/.kube/config
+    #     state: absent
+
     - name: init command
       ansible.builtin.shell: kubeadm init --pod-network-cidr=10.0.0.0/16
       args:
         creates: /etc/kubernetes/admin.conf
 
+    # - name: ensure root .kube directory exists
+    #   ansible.builtin.file:
+    #     path: /root/.kube
+    #     state: directory
+    #     mode: "0755"
+
     - name: copy kubeconfig for root
-      ansible.builtin.command: >
-        mkdir -p /root/.kube && cp /etc/kubernetes/admin.conf /root/.kube/config
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        owner: root
+        group: root
+        mode: "0600"
+        remote_src: yes
+
+- name: install helm
+  hosts: control-plane
+  become: true
+  tasks:
+
+    - name: download helm installer
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
+        dest: /tmp/get_helm.sh
+        mode: "0755"
+
+    - name: install helm binary
+      ansible.builtin.shell: /tmp/get_helm.sh
       args:
-        creates: /root/.kube/config
+        creates: /usr/local/bin/helm
 
-    - name: install cilium
-      ansible.builtin.shell: >
-        kubectl apply -f https://raw.githubusercontent.com/cilium/cilium/v1.16.1/install/kubernetes/cilium.yaml
+    - name: add cilium helm repo
+      ansible.builtin.command:
+        cmd: helm repo add cilium https://helm.cilium.io
+      register: add_repo
+      failed_when: add_repo.rc not in [0,1]
+      changed_when: add_repo.rc == 0
 
-    - name: wait for cilium daemonset to become ready
-      kubernetes.core.k8s_info:
-        api_version: v1
-        kind: Pod
-        namespace: kube-system
-      register: cilium_pods
-      until: >
-        cilium_pods.resources
-        | selectattr('metadata.labels.k8s-app', 'equalto', 'cilium')
-        | map(attribute='status.containerStatuses[0].ready')
-        | list
-        | min
+    - name: update helm repos
+      ansible.builtin.command: helm repo update
+
+    - name: install cilium via helm
+      ansible.builtin.command: >
+        helm upgrade --install cilium cilium/cilium
+        --namespace kube-system
+        --set kubeProxyReplacement=true
+        --set ipam.mode=kubernetes
+        --set tunnel=vxlan
+        --version 1.16.1
+
+    - name: wait until cilium pods are ready
+      ansible.builtin.shell: |
+        kubectl -n kube-system get pods -l k8s-app=cilium \
+          -o jsonpath="{range .items[*]}{range .status.containerStatuses[*]}{.ready}{' '}{end}{end}"
+      register: cilium_ready
+      until: "'False' not in cilium_ready.stdout"
       retries: 30
       delay: 10
 
     - name: wait for cilium operator to become ready
-      kubernetes.core.k8s_info:
-        api_version: v1
-        kind: Pod
-        namespace: kube-system
-        label_selectors:
-          - k8s-app=cilium-operator
-      register: operator_pods
-      until: >
-        operator_pods.resources
-        | map(attribute='status.containerStatuses[0].ready')
-        | list
-        | min
+      ansible.builtin.shell: |
+        kubectl -n kube-system get deployment cilium-operator \
+          -o jsonpath="{.status.readyReplicas}"
+      register: operator_status
+      until: operator_status.stdout|int > 0
       retries: 30
       delay: 10
 
-    - name: get worker join token
+- name: generate join token on control-plane
+  hosts: control-plane
+  become: true
+  run_once: true
+
+  tasks:
+    - name: generate join token
       ansible.builtin.command: kubeadm token create --print-join-command
       register: join_output
 
-    - name: set join token fact
-      ansible.builtin.set_fact:
+    - name: create global token holder
+      add_host:
+        name: token_holder
         join_token: "{{ join_output.stdout }}"
+
+    - name: debug created token
+      debug:
+        var: join_output.stdout
+
 
 - name: join workers to the family
   hosts: worker-nodes
   become: true
   tasks:
+    - name: debug join token visible to worker
+      debug:
+        var: hostvars['token_holder'].join_token
+
     - name: run join command
-      ansible.builtin.command: "{{ join_token }}"
+      ansible.builtin.command: "{{ hostvars['token_holder'].join_token }}"
       args:
         creates: /etc/kubernetes/kubelet.conf
