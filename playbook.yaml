@@ -45,6 +45,21 @@
         rule: allow
         port: '6443'
 
+    - name: datadog port 1
+      community.general.ufw:
+        rule: allow
+        port: '8125'
+
+    - name: datadog port 2
+      community.general.ufw:
+        rule: allow
+        port: '8126'
+
+    - name: datadog port 3
+      community.general.ufw:
+        rule: allow
+        port: '5555'
+
     - name: etc server client api
       community.general.ufw:
         rule: allow
