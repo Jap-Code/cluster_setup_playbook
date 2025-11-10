@@ -49,6 +49,7 @@
       community.general.ufw:
         rule: allow
         port: '8125'
+        proto: udp
 
     - name: datadog port 2
       community.general.ufw:
